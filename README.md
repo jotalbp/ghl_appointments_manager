@@ -67,13 +67,4 @@ Lanza la app:
 streamlit run app.py
 ```
 
----
-
-## Archivos
-
-| Archivo               | Descripción                                         |
-|-----------------------|-----------------------------------------------------|
-| `app.py`              | Interfaz Streamlit principal                        |
-| `upsert_citas_ghl.py` | Script CLI alternativo (sin interfaz)               |
-| `config.json`         | Configuración persistida (profesionales y horarios) |
-| `requirements.txt`    | Dependencias Python                                 |
+                          |
