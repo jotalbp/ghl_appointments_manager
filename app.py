@@ -18,13 +18,13 @@ from dotenv import load_dotenv
 
 load_dotenv(Path(__file__).parent / ".env")
 
-CONFIG_PATH = Path(__file__).parent / "config.json"
-TIMEZONE    = "Europe/Madrid"
-BASE_URL    = "https://services.leadconnectorhq.com"
+CONFIG_PATH  = Path(__file__).parent / "config.json"
+TIMEZONE     = "Europe/Madrid"
+BASE_URL     = "https://services.leadconnectorhq.com"
+DIAS_SEMANA  = ["Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado", "Domingo"]
 
 # ─── Config ───────────────────────────────────────────────────────────────────
 
-DEFAULT_SHIFTS   = [{"apertura": "09:30", "cierre": "13:30"}]
 DEFAULT_DURATION = 20
 
 def _env_staff() -> list[dict]:
@@ -34,22 +34,16 @@ def _env_staff() -> list[dict]:
     return [{"nombre": k, "user_id": v} for k, v in json.loads(raw).items()]
 
 def load_config() -> dict:
-    # Prioridad: config.json > .env > defaults
     base = {
-        "api_token":    os.getenv("GHL_API_TOKEN",    ""),
-        "location_id":  os.getenv("GHL_LOCATION_ID",  ""),
-        "calendar_id":  os.getenv("GHL_CALENDAR_ID",  ""),
-        "staff":        _env_staff(),
-        "shifts":       DEFAULT_SHIFTS,
+        "api_token":     os.getenv("GHL_API_TOKEN",   ""),
+        "location_id":   os.getenv("GHL_LOCATION_ID", ""),
+        "calendar_id":   os.getenv("GHL_CALENDAR_ID", ""),
+        "staff":         _env_staff(),
         "slot_duration": DEFAULT_DURATION,
+        "doctor_shifts": {},
     }
     if CONFIG_PATH.exists():
         stored = json.loads(CONFIG_PATH.read_text())
-        if "morning_start" in stored and "shifts" not in stored:
-            stored["shifts"] = [
-                {"apertura": stored["morning_start"],   "cierre": stored["morning_end"]},
-                {"apertura": stored["afternoon_start"], "cierre": stored["afternoon_end"]},
-            ]
         base.update(stored)
     return base
 
@@ -76,30 +70,84 @@ def normalize_slot(raw: time, taken: set, valid_slots: list[time]) -> time | Non
             return slot
     return None
 
-def preprocess_csv(rows: list[dict], valid_slots: list[time], duration: int) -> list[dict]:
+def get_doctor_slots(profesional: str, date_str: str, doctor_shifts: dict, duration: int) -> list[time]:
+    weekday = datetime.strptime(date_str, "%d/%m/%Y").weekday()
+    shifts  = [s for s in doctor_shifts.get(profesional, []) if int(s["dia"]) == weekday]
+    return build_slots(shifts, duration)
+
+def shifts_to_csv(shifts: dict) -> str:
+    rows = [
+        {"Profesional": prof, "Dia": DIAS_SEMANA[s["dia"]], "Apertura": s["apertura"], "Cierre": s["cierre"]}
+        for prof, shift_list in shifts.items()
+        for s in shift_list
+    ]
+    return pd.DataFrame(rows).to_csv(index=False)
+
+def parse_shifts_csv(content: bytes) -> dict[str, list[dict]]:
+    df = pd.read_csv(io.StringIO(content.decode("utf-8")))
+    result: dict[str, list[dict]] = {}
+    for _, row in df.iterrows():
+        prof     = str(row["Profesional"]).strip()
+        dia_name = str(row["Dia"]).strip()
+        if dia_name not in DIAS_SEMANA:
+            continue
+        result.setdefault(prof, []).append({
+            "dia":      DIAS_SEMANA.index(dia_name),
+            "apertura": str(row["Apertura"]).strip(),
+            "cierre":   str(row["Cierre"]).strip(),
+        })
+    return result
+
+def normalize_phone(phone: str) -> str:
+    if not phone or phone == "-":
+        return phone
+    digits = phone.replace(" ", "").replace("-", "")
+    if digits.startswith("+"):
+        return digits
+    if digits.startswith("00"):
+        return "+" + digits[2:]
+    if len(digits) == 9 and digits[0] in "6789":
+        return "+34" + digits
+    return phone
+
+def preprocess_csv(rows: list[dict], doctor_shifts: dict, duration: int) -> list[dict]:
     taken: dict[tuple, set] = {}
     result = []
     for row in rows:
         date_str    = row["Date"]
         profesional = row["Profesional"].strip()
-        raw_start   = datetime.strptime(row["Tarea"].strip(), "%H:%M").time()
-        key = (date_str, profesional)
-        taken.setdefault(key, set())
-        slot = normalize_slot(raw_start, taken[key], valid_slots)
-        if slot is None:
+        raw_time_str = row["Tarea"].strip()
+        try:
+            raw_start = datetime.strptime(raw_time_str, "%H:%M").time()
+        except ValueError:
             continue
+        phone = normalize_phone(row["Teléfono"].strip())
+        key   = (date_str, profesional)
+        taken.setdefault(key, set())
+
+        valid_slots = get_doctor_slots(profesional, date_str, doctor_shifts, duration)
+
+        sin_horario = not valid_slots
+        if valid_slots:
+            slot = normalize_slot(raw_start, taken[key], valid_slots)
+            if slot is None:
+                continue
+        else:
+            slot = raw_start
+
         taken[key].add(slot)
         slot_str = slot.strftime("%H:%M")
         end_str  = (datetime.combine(datetime.today(), slot) + timedelta(minutes=duration)).strftime("%H:%M")
         result.append({
             "Fecha":       date_str,
             "Paciente":    row["Paciente"].strip(),
-            "Telefono":    row["Teléfono"].strip(),
+            "Telefono":    phone,
             "Profesional": profesional,
-            "Original":    row["Tarea"].strip(),
+            "Original":    raw_time_str,
             "Start":       slot_str,
             "End":         end_str,
-            "ajustado":    slot_str != row["Tarea"].strip(),
+            "ajustado":    slot_str != raw_time_str,
+            "sin_horario": sin_horario,
         })
     return result
 
@@ -180,6 +228,13 @@ csv_professionals: list[str] = []
 if uploaded is not None:
     content = uploaded.read()
     raw_rows = list(csv.DictReader(io.StringIO(content.decode("utf-8"))))
+    # Normalizar fechas a DD/MM/YYYY por si vienen con dígitos simples (3/8/2026 → 03/08/2026)
+    for r in raw_rows:
+        try:
+            parts = r["Date"].split("/")
+            r["Date"] = f"{int(parts[0]):02d}/{int(parts[1]):02d}/{parts[2]}"
+        except Exception:
+            pass
     csv_professionals = sorted({r["Profesional"].strip() for r in raw_rows})
 
 # ── 2. Sidebar ────────────────────────────────────────────────────────────────
@@ -205,7 +260,7 @@ with st.sidebar:
     edited_staff = st.data_editor(
         pd.DataFrame(staff_data),
         num_rows="dynamic",
-        use_container_width=True,
+        width="stretch",
         column_config={
             "nombre":  st.column_config.TextColumn("Nombre en CSV", disabled=bool(csv_professionals)),
             "user_id": st.column_config.TextColumn("User ID en GHL"),
@@ -214,86 +269,135 @@ with st.sidebar:
         key="staff_editor",
     )
 
-    st.divider()
-    st.markdown("**Horario de la clínica**")
-    st.caption("Añade una fila por franja horaria (mañana, tarde, noche…)")
-
-    shifts_df = pd.DataFrame(cfg["shifts"])
-    edited_shifts = st.data_editor(
-        shifts_df,
-        num_rows="dynamic",
-        use_container_width=True,
-        column_config={
-            "apertura": st.column_config.TextColumn("Apertura", help="HH:MM"),
-            "cierre":   st.column_config.TextColumn("Cierre",   help="HH:MM"),
-        },
-        hide_index=True,
-        key="shifts_editor",
-    )
-
     slot_duration = st.number_input(
         "Duración de cita (min)", min_value=5, max_value=120, step=5,
         value=int(cfg["slot_duration"]),
     )
 
-    try:
-        valid_shifts  = edited_shifts.dropna().to_dict("records")
-        preview_slots = build_slots(valid_shifts, slot_duration)
-        st.caption(f"{len(preview_slots)} slots disponibles por profesional/día")
-    except Exception:
-        preview_slots = []
-        valid_shifts  = []
-        st.error("Formato de hora incorrecto. Usa HH:MM.")
+    st.divider()
+    st.markdown("**Horarios por profesional**")
+
+    shifts_file = st.file_uploader("Importar horarios (CSV)", type="csv", key="shifts_uploader",
+                                   help="Columnas: Profesional, Dia, Apertura, Cierre")
+    saved_shifts = cfg.get("doctor_shifts", {})
+
+    if shifts_file is not None:
+        try:
+            saved_shifts = parse_shifts_csv(shifts_file.read())
+            st.success("Horarios importados — pulsa Guardar configuración para persistirlos.")
+        except Exception as e:
+            st.error(f"Error al leer el CSV de horarios: {e}")
+
+    st.caption("Puedes editar las franjas directamente en la tabla de cada médico.")
+    all_doctors   = csv_professionals or [s["nombre"] for s in cfg["staff"] if s.get("nombre")]
+    edited_doctor_shifts: dict[str, list[dict]] = {}
+
+    for doctor in all_doctors:
+        has_shifts = bool(saved_shifts.get(doctor))
+        with st.expander(doctor, expanded=not has_shifts):
+            saved_rows = saved_shifts.get(doctor, [])
+            # Convertir número de día → nombre para mostrar en la UI
+            display_rows = [
+                {"dia": DIAS_SEMANA[r["dia"]], "apertura": r["apertura"], "cierre": r["cierre"]}
+                for r in saved_rows
+            ] if saved_rows else []
+            empty_cols   = pd.DataFrame(columns=["dia", "apertura", "cierre"])
+            default_rows = pd.DataFrame(display_rows) if display_rows else empty_cols
+            edited_df = st.data_editor(
+                default_rows,
+                num_rows="dynamic",
+                width="stretch",
+                column_config={
+                    "dia":      st.column_config.SelectboxColumn("Día", options=DIAS_SEMANA, required=True),
+                    "apertura": st.column_config.TextColumn("Apertura (HH:MM)"),
+                    "cierre":   st.column_config.TextColumn("Cierre (HH:MM)"),
+                },
+                hide_index=True,
+                key=f"shifts_{doctor}",
+            )
+            try:
+                rows_clean = [
+                    # Convertir nombre de día → número para guardar/procesar
+                    {"dia": DIAS_SEMANA.index(r["dia"]), "apertura": r["apertura"], "cierre": r["cierre"]}
+                    for r in edited_df.dropna(subset=["dia", "apertura", "cierre"]).to_dict("records")
+                    if r["dia"] in DIAS_SEMANA
+                ]
+                edited_doctor_shifts[doctor] = rows_clean
+                total = sum(len(build_slots([r], slot_duration)) for r in rows_clean)
+                st.caption(f"{total} slots semanales")
+            except Exception:
+                edited_doctor_shifts[doctor] = saved_shifts.get(doctor, [])
+                st.error("Formato incorrecto en horario.")
 
     st.divider()
 
-    if st.button("Guardar configuración", use_container_width=True, type="primary"):
+    if st.button("Guardar configuración", width="stretch", type="primary"):
         save_config({
-            "api_token":    api_token,
-            "location_id":  location_id,
-            "calendar_id":  calendar_id,
-            "staff":        edited_staff.dropna(subset=["nombre"]).to_dict("records"),
-            "shifts":       valid_shifts,
+            "api_token":     api_token,
+            "location_id":   location_id,
+            "calendar_id":   calendar_id,
+            "staff":         edited_staff.dropna(subset=["nombre"]).to_dict("records"),
             "slot_duration": slot_duration,
+            "doctor_shifts": edited_doctor_shifts,
         })
         cfg = load_config()
         st.success("Guardado")
 
     staff_map = {r["nombre"]: r["user_id"] for _, r in edited_staff.iterrows() if r["nombre"] and r["user_id"]}
-    config_ok = bool(api_token and location_id and calendar_id and staff_map and preview_slots)
+    config_ok = bool(api_token and location_id and calendar_id and staff_map)
 
     if not config_ok:
         st.warning("Rellena todos los campos para sincronizar.")
 
-# ── 3. Procesar CSV con el horario activo ─────────────────────────────────────
+# ── 3. Recalcular citas ───────────────────────────────────────────────────────
 
 if not raw_rows:
     st.info("Sube un fichero CSV para continuar.")
     st.stop()
 
 @st.cache_data
-def get_records(rows_json: str, shifts_json: str, dur: int) -> list[dict]:
-    slots = build_slots(json.loads(shifts_json), dur)
-    return preprocess_csv(json.loads(rows_json), slots, dur)
+def get_records(rows_json: str, doctor_shifts_json: str, dur: int) -> list[dict]:
+    return preprocess_csv(json.loads(rows_json), json.loads(doctor_shifts_json), dur)
 
-try:
-    records = get_records(
-        json.dumps(raw_rows,    ensure_ascii=False),
-        json.dumps(valid_shifts, ensure_ascii=False),
-        slot_duration,
-    )
-except Exception as e:
-    st.error(f"Error procesando el CSV: {e}")
+if "records" not in st.session_state:
+    st.session_state.records    = []
+    st.session_state.calculated = False
+
+col_calc, col_info = st.columns([2, 5])
+if col_calc.button("Recalcular citas", type="primary", width="stretch"):
+    try:
+        st.session_state.records = get_records(
+            json.dumps(raw_rows,             ensure_ascii=False),
+            json.dumps(edited_doctor_shifts, ensure_ascii=False),
+            slot_duration,
+        )
+        st.session_state.calculated = True
+        st.session_state.statuses   = {i: "Pendiente" for i in range(len(st.session_state.records))}
+    except Exception as e:
+        st.error(f"Error procesando el CSV: {e}")
+        st.stop()
+
+if not st.session_state.calculated:
+    col_info.info("Configura los horarios en la sidebar y pulsa **Recalcular citas** para ver y ajustar los slots.")
     st.stop()
+
+records = st.session_state.records
 
 # ── 4. Métricas + tabla ───────────────────────────────────────────────────────
 
-if "statuses" not in st.session_state or len(st.session_state.statuses) != len(records):
+if len(st.session_state.statuses) != len(records):
     st.session_state.statuses = {i: "Pendiente" for i in range(len(records))}
+
+sin_horario_total = sum(r.get("sin_horario", False) for r in records)
+if sin_horario_total:
+    st.warning(
+        f"{sin_horario_total} cita(s) sin horario configurado — se usa la hora del CSV tal cual. "
+        "Configura los turnos en la sidebar y vuelve a recalcular."
+    )
 
 c1, c2, c3, c4 = st.columns(4)
 c1.metric("Total citas",   len(records))
-c2.metric("Ajustadas",     sum(r["ajustado"] for r in records))
+c2.metric("Ajustadas",     sum(r.get("ajustado", False) for r in records))
 c3.metric("Sin teléfono",  sum(r["Telefono"] == "-" for r in records))
 c4.metric("Sincronizadas", sum(1 for s in st.session_state.statuses.values() if s.startswith("OK")))
 
@@ -302,14 +406,14 @@ st.divider()
 df = pd.DataFrame([{
     "Fecha": r["Fecha"], "Paciente": r["Paciente"], "Teléfono": r["Telefono"],
     "Profesional": r["Profesional"], "Start": r["Start"], "End": r["End"],
-    "Ajustado": "Si" if r["ajustado"] else "",
+    "Slot": "ajustado" if r.get("ajustado") else ("sin horario" if r.get("sin_horario") else "ok"),
     "Estado": st.session_state.statuses[i],
 } for i, r in enumerate(records)])
 
-st.dataframe(df, use_container_width=True, height=460, hide_index=True,
+st.dataframe(df, width="stretch", height=460, hide_index=True,
     column_config={
-        "Ajustado": st.column_config.TextColumn(width=80),
-        "Estado":   st.column_config.TextColumn(width=140),
+        "Slot":   st.column_config.TextColumn(width=100),
+        "Estado": st.column_config.TextColumn(width=140),
         "Start":    st.column_config.TextColumn(width=70),
         "End":      st.column_config.TextColumn(width=70),
     })
@@ -317,8 +421,8 @@ st.dataframe(df, use_container_width=True, height=460, hide_index=True,
 st.divider()
 
 col_run, col_reset = st.columns([4, 1])
-run   = col_run.button("Sincronizar con GHL", type="primary", use_container_width=True, disabled=not config_ok)
-reset = col_reset.button("Resetear estados", use_container_width=True)
+run   = col_run.button("Sincronizar con GHL", type="primary", width="stretch", disabled=not config_ok)
+reset = col_reset.button("Resetear estados", width="stretch")
 
 if reset:
     st.session_state.statuses = {i: "Pendiente" for i in range(len(records))}
